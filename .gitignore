@@ -1,0 +1,17 @@
+# Ledger data and archives — business data, never commit
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+archive/
+
+# Sign-in accounts (usernames + password hashes)
+accounts.local.json
+
+# Python / editor
+__pycache__/
+*.pyc
+.venv/
+venv/
+.streamlit/secrets.toml
+.DS_Store
