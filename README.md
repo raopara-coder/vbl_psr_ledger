@@ -30,6 +30,13 @@ python accounts.py list
 ```
 Run the same `set` command again to change a password.
 
+## Deploy on Streamlit Community Cloud
+1. New app → GitHub URL `https://github.com/raopara-coder/vbl_psr_ledger/blob/main/app.py`.
+2. Advanced settings → Secrets: paste the output of `python accounts.py secrets` (run on the PC that has
+   `accounts.local.json`). It contains only usernames and password hashes.
+3. Note: Streamlit Cloud does not keep files between restarts, so a SQLite ledger there can be lost.
+   Use a hosted database before relying on the cloud copy.
+
 ## Data
 - Each entity's ledger is a SQLite file: `psr_ledger_<entity>.db` (not committed — back it up yourself).
 - Archived months are also copied to `archive/<entity>/*.csv`.

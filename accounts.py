@@ -24,9 +24,15 @@ ACCOUNTS_FILE = Path(os.environ.get("PSR_LEDGER_ACCOUNTS") or Path(__file__).wit
 
 
 def load() -> dict:
-    if not ACCOUNTS_FILE.exists():
+    """accounts.local.json on this PC; on Streamlit Cloud, the [accounts] block in the app's Secrets."""
+    if ACCOUNTS_FILE.exists():
+        return json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
+    try:
+        import streamlit as st
+        sec = st.secrets.get("accounts", {})
+        return {k: dict(v) for k, v in sec.items()}
+    except Exception:  # no secrets configured
         return {}
-    return json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
 
 
 ACCOUNTS = load()
@@ -62,5 +68,11 @@ if __name__ == "__main__":
     elif args[:1] == ["list"]:
         for k, v in load().items():
             print(f"{k:10} {v['label']:12} {v['username']}")
+    elif args[:1] == ["secrets"]:   # print the block to paste into Streamlit Cloud -> Settings -> Secrets
+        for k, v in load().items():
+            print(f"[accounts.{k}]")
+            for f in ["label", "full_name", "username", "hash"]:
+                print(f'{f} = "{v[f]}"')
+            print()
     else:
         sys.exit(__doc__)
