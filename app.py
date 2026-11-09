@@ -15,6 +15,8 @@ from parser import parse_text
 
 import accounts
 
+accounts.ACCOUNTS = accounts.load()   # re-read every run, so Secrets edited on Streamlit Cloud apply at once
+
 APP_NAME = "VBL PSR Ledger"
 st.set_page_config(page_title=APP_NAME, page_icon="📒", layout="wide")
 
@@ -711,9 +713,10 @@ def login_page():
     st.html(f'<div class="fn-login-head"><div class="fn-logo">₹</div><b>{APP_NAME}</b>'
             '<span>Sign in to your entity\'s ledger</span></div>')
     if not accounts.ACCOUNTS:
-        st.error("No accounts set up yet. In this folder run:\n\n"
-                 "`python accounts.py set <entity> <label> \"<full name>\" <username> <password>`\n\n"
-                 "then restart the app. See README.md.")
+        st.error("No sign-in accounts found.\n\n"
+                 "**On Streamlit Cloud:** app menu → Settings → Secrets, paste the `[accounts.…]` block, Save.\n\n"
+                 "**On your PC:** run `python accounts.py set <entity> <label> \"<full name>\" <username> <password>` "
+                 "in the app folder. See README.md.")
         return
     locked_until = st.session_state.get("lock_until")
     with st.container(key="card_login"):
