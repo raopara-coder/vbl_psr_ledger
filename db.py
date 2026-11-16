@@ -79,6 +79,13 @@ def check_online() -> str | None:
     url = database_url()
     if not url:
         return None
+    rest = url.split("://", 1)[1]
+    creds = rest.rsplit("@", 1)[0] if "@" in rest else ""
+    pw_full = creds.split(":", 1)[1] if ":" in creds else ""
+    if any(c in pw_full for c in "@[]#/?"):
+        return ("The password part of the link contains @, [ ] or another symbol, so the link breaks. "
+                "Remove the square brackets. If the password itself has @ # / ?, reset it in Supabase "
+                "(Project Settings → Database) to letters and numbers only, and put the new one in the link.")
     try:
         import psycopg
         with psycopg.connect(url, connect_timeout=10, prepare_threshold=None) as c:
@@ -86,9 +93,10 @@ def check_online() -> str | None:
         return None
     except Exception as ex:
         msg = str(ex).strip().splitlines()[0] if str(ex).strip() else type(ex).__name__
-        pw = re.search(r"://[^:/@]+:([^@]*)@", url)
-        if pw and pw[1]:
-            msg = msg.replace(pw[1], "***")
+        # never show any piece of the password
+        for piece in sorted({pw_full, *re.split(r"[@\[\]:/#?]", pw_full)}, key=len, reverse=True):
+            if len(piece) >= 3:
+                msg = msg.replace(piece, "***")
         host = re.search(r"@([^:/]+)", url)
         hint = ""
         low = msg.lower()
