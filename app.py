@@ -11,6 +11,7 @@ import pandas as pd
 import streamlit as st
 
 import db
+import importer
 from parser import parse_text
 
 import accounts
@@ -689,6 +690,79 @@ def page_archive():
     footer()
 
 
+def page_import():
+    st.html('<div class="fn-h1">Import Excel</div><div class="fn-sub">Upload the PSR-wise credit list '
+            '(one sheet per PSR: DATE, NAME, PSR, TOTAL BILL, PAYMENT, DUE, REMARKS). Upload each newer copy too: '
+            'only new bills and new payments are added.</div>')
+    up = st.file_uploader("Credit list (.xlsx)", type=["xlsx"], key="imp_file")
+    if not up:
+        st.caption("Bills become **Credit** entries. Money in PAYMENT becomes a **Payment** entry dated by the "
+                   "last date in REMARKS ((U) = UPI, (C) = Cash, CHQ = Cheque). PSRs are matched by their code "
+                   "(PSR-1, CE …), kept in the PSR's Area, and named from the TOTAL sheet.")
+        return
+    sig = f"{up.name}|{up.size}"
+    if st.session_state.get("imp_sig") != sig:
+        try:
+            parsed = importer.read_workbook(up, up.name)
+        except Exception as ex:
+            st.error(f"Could not read this file: {ex}")
+            return
+        if parsed["bills"].empty:
+            st.error("No bills found. Each sheet needs the columns DATE, NAME, PSR, TOTAL BILL, PAYMENT, DUE, REMARKS.")
+            return
+        db.init_db()
+        st.session_state.update(imp_sig=sig, imp_parsed=parsed, imp_plan=importer.plan(parsed))
+    parsed, plan = st.session_state["imp_parsed"], st.session_state["imp_plan"]
+    b, chk = parsed["bills"], parsed["checks"]
+
+    kpis([("File date", f"{parsed['snapshot']:%d %b %Y}", "from the file name", ""),
+          ("Bills", str(len(b)), f"{b['code'].nunique()} PSRs", ""),
+          ("Total bills", fmt(b["bill"].sum()), f"payments {fmt(b['paid'].sum())}", ""),
+          ("Due in file", fmt(b["due"].sum()), "sum of DUE", "red")])
+
+    heading("CHECK", "File totals per PSR")
+    rows = [[f"<b>{esc(r.sheet)}</b>", esc(r.person) or '<span class="fn-muted">—</span>', str(r.bills),
+             fmt(r.due_in_rows), "—" if pd.isna(r.sheet_total) else fmt(r.sheet_total),
+             '<span class="fn-green">✓ matches</span>' if r.ok else '<span class="fn-red">✗ differs</span>']
+            for r in chk.itertuples()]
+    table([("Sheet", ""), ("PSR", ""), ("Bills", "r"), ("Due (rows)", "r"), ("Sheet total", "r"), ("", "r")], rows)
+    if parsed["warnings"]:
+        with st.expander(f"⚠️ {len(parsed['warnings'])} things to look at in the file"):
+            for w in parsed["warnings"]:
+                st.write("• " + w)
+
+    heading("PREVIEW", "What will be added")
+    if plan.empty:
+        st.success("The ledger already matches this file. Nothing to add.")
+        return
+    counts = plan["action"].value_counts()
+    st.caption(" · ".join(f"**{n}** {a.lower()}" for a, n in counts.items()) +
+               ". Untick a row to skip it. *Not in file* rows are bills you imported before that are missing now — "
+               "tick them only if they were fully paid.")
+    edited = st.data_editor(
+        plan.drop(columns=["key", "code"]), hide_index=True, width="stretch", key=f"imp_editor_{sig}",
+        disabled=["action", "psr", "date", "shop", "amount", "mode", "notes"],
+        column_config={"apply": st.column_config.CheckboxColumn("Add?"), "action": "What", "psr": "PSR",
+                       "date": st.column_config.DateColumn("Date", format="DD/MM/YYYY"), "shop": "Shop",
+                       "amount": st.column_config.NumberColumn("Amount", format="%.2f"), "mode": "Mode",
+                       "notes": "Remarks"})
+    plan = plan.assign(apply=edited["apply"].values)
+    todo = plan[plan["apply"] & ~plan["action"].str.startswith("Check")]
+    new_psrs = sorted(set(todo["psr"]) - set(psr_names(active_only=False)))
+    if new_psrs:
+        st.info(f"{len(new_psrs)} PSRs will be created: " + ", ".join(new_psrs))
+    if st.button(f"Import {len(todo)} rows", type="primary", icon=":material/upload:", disabled=todo.empty,
+                 key="imp_go"):
+        with st.spinner("Saving…"):
+            r = importer.apply_plan(plan)
+        msg = f"Imported {r['saved']} rows for {r['psrs']} PSRs."
+        if r["skipped"]:
+            msg += f" Skipped {r['skipped']} dated in archived months."
+        flash(msg)
+        st.session_state["imp_plan"] = importer.plan(parsed)
+        st.rerun()
+
+
 # ======================================================================== shell
 PAGES = {
     "Overview": (":material/space_dashboard:", page_overview),
@@ -696,6 +770,7 @@ PAGES = {
     "Transactions": (":material/receipt_long:", page_transactions),
     "Monthly": (":material/calendar_month:", page_monthly),
     "Archive": (":material/inventory_2:", page_archive),
+    "Import Excel": (":material/upload_file:", page_import),
 }
 MAX_TRIES, LOCK_SECONDS = 5, 60
 

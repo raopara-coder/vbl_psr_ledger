@@ -12,6 +12,7 @@ separately and has its own ledger.
 | Transactions | Search and filter, edit or delete entries, CSV export |
 | Monthly | Per-PSR month-end consolidation, month-by-month trend, PSR × month grid |
 | Archive | Close finished months: entries are locked, saved to CSV, and still count in balances |
+| Import Excel | Upload the PSR-wise credit list (.xlsx): checks sheet totals, previews, then adds new bills and payments only |
 
 ## Run
 ```bash

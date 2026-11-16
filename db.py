@@ -126,6 +126,11 @@ class _PGCon:
             return _Done(cur.fetchone()[0], cur.rowcount)
         return cur
 
+    def executemany(self, sql, seq):
+        cur = self.c.cursor()
+        cur.executemany(_to_pg(sql), [_clean(p) for p in seq])   # psycopg pipelines this: one round trip
+        return cur
+
 
 def _clean(params):
     """numpy / pandas values from data editors -> plain Python values the drivers accept."""
@@ -248,7 +253,9 @@ CREATE TABLE IF NOT EXISTS archives (
     export_file TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_entries_psr  ON entries(psr_id);
-CREATE INDEX IF NOT EXISTS ix_entries_date ON entries(entry_date)
+CREATE INDEX IF NOT EXISTS ix_entries_date ON entries(entry_date);
+ALTER TABLE entries ADD COLUMN IF NOT EXISTS src_key TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS ix_entries_src ON entries(src_key)
 """
 
 
@@ -266,6 +273,9 @@ def init_db(path=None) -> None:
         cols = [r[1] for r in con.execute("PRAGMA table_info(entries)")]
         if "archived" not in cols:   # databases created before archiving existed
             con.execute("ALTER TABLE entries ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+        if "src_key" not in cols:    # key of the Excel bill an entry was imported from
+            con.execute("ALTER TABLE entries ADD COLUMN src_key TEXT NOT NULL DEFAULT ''")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_entries_src ON entries(src_key)")
 
 
 # -------------------------------------------------------------------- PSRs
@@ -282,6 +292,56 @@ def get_or_create_psr(name, path=None) -> int:
     with connect(path) as con:
         row = con.execute("SELECT id FROM psrs WHERE lower(name)=lower(?)", (name.strip(),)).fetchone()
     return row["id"] if row else add_psr(name, path=path)
+
+
+def get_or_create_psr_by_code(code: str, name: str, path=None) -> int:
+    """For imports: find the PSR whose Area is this code (e.g. 'PSR-1'), else by name, else create one."""
+    with connect(path) as con:
+        row = con.execute("SELECT id FROM psrs WHERE upper(area)=upper(?) ORDER BY id", (code,)).fetchone()
+        if row:
+            return row["id"]
+        row = con.execute("SELECT id, area FROM psrs WHERE lower(name)=lower(?)", (name.strip(),)).fetchone()
+        if row and not (row["area"] or "").strip():
+            con.execute("UPDATE psrs SET area=? WHERE id=?", (code, row["id"]))
+            return row["id"]
+    if row:   # same name already used for a different code
+        name = f"{name} ({code})"
+    return add_psr(name, area=code, path=path)
+
+
+def import_state(path=None) -> dict:
+    """Imported bills already in the ledger: {bill key: {bill, paid, last_pay, psr, shop}}."""
+    q = """
+    SELECT c.src_key AS key, c.amount AS bill, c.shop, p.name AS psr,
+      COALESCE((SELECT SUM(x.amount) FROM entries x WHERE x.src_key = c.src_key || '|pay'), 0) AS paid,
+      (SELECT MAX(x.entry_date) FROM entries x WHERE x.src_key = c.src_key || '|pay') AS last_pay
+    FROM entries c JOIN psrs p ON p.id = c.psr_id
+    WHERE c.kind = 'Credit' AND c.src_key LIKE 'bill:%'
+    """
+    with connect(path) as con:
+        df = query_df(con, q)
+    return {r.key: {"bill": float(r.bill), "paid": float(r.paid), "last_pay": r.last_pay, "psr": r.psr,
+                    "shop": r.shop} for r in df.itertuples()}
+
+
+def add_entries_bulk(rows: list[dict], path=None) -> dict:
+    """Insert many entries in one transaction. Rows dated in archived months are skipped."""
+    cut = closed_until(path)
+    now = datetime.now().isoformat(timespec="seconds")
+    ok, skipped = [], []
+    for r in rows:
+        if r["kind"] not in KINDS or float(r["amount"]) <= 0:
+            skipped.append(r); continue
+        if cut and str(r["entry_date"]) <= cut:
+            skipped.append(r); continue
+        ok.append((str(r["entry_date"]), int(r["psr_id"]), (r.get("shop") or "").strip().title(), r["kind"],
+                   round(float(r["amount"]), 2), r.get("mode") or "", r.get("bill_no") or "",
+                   r.get("notes") or "", r.get("raw_text") or "", now, r.get("src_key") or ""))
+    if ok:
+        with connect(path) as con:
+            con.executemany("INSERT INTO entries(entry_date, psr_id, shop, kind, amount, mode, bill_no, notes,"
+                            " raw_text, created_at, src_key) VALUES (?,?,?,?,?,?,?,?,?,?,?)", ok)
+    return {"saved": len(ok), "skipped": len(skipped)}
 
 
 def update_psr(pid, path=None, **fields) -> None:
