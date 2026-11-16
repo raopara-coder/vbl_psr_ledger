@@ -397,7 +397,7 @@ def footer():
     cut = db.closed_until()
     right = f"Archived up to {pd.to_datetime(cut):%d %b %Y}" if cut else "Credit adds to a PSR's outstanding; payments reduce it"
     who = accounts.ACCOUNTS[st.session_state["entity"]]["full_name"]
-    st.html(f'<div class="fn-foot"><span>{esc(who)} ledger · stored on this computer ({db.current_path().name})</span>'
+    st.html(f'<div class="fn-foot"><span>{esc(who)} ledger · stored in {esc(db.storage_label())}</span>'
             f'<span>{esc(right)}</span></div>')
 
 
@@ -770,7 +770,7 @@ with st.sidebar:
     for name, (icon, _) in PAGES.items():
         st.button(name, icon=icon, key=f"nav_{name.replace(' ', '_')}", on_click=_go, args=(name,),
                   type="primary" if st.session_state["page"] == name else "tertiary", width="stretch")
-    st.html('<div class="fn-side-note">🛡️ Each entity\'s ledger is separate and stored only on this computer.</div>'
+    st.html('<div class="fn-side-note">🛡️ Each entity\'s ledger is separate. Stored in ' + esc(db.storage_label()) + '.</div>'
             f'<div class="fn-user"><div class="fn-av">{esc(ACC["label"][:1])}</div><div>'
             f'<b>{esc(st.session_state["username"])}</b><span>{esc(ACC["full_name"])}</span></div></div>')
     st.button("Sign out", icon=":material/logout:", key="nav_signout", on_click=logout, type="tertiary",

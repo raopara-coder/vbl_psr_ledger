@@ -1,4 +1,10 @@
-"""Backend for the PSR ledger: SQLite file `psr_ledger.db` next to this file.
+"""Backend for the PSR ledger.
+
+Storage:
+  * Online Postgres (e.g. Supabase) when a database URL is set - in Streamlit Secrets as
+    [database] url = "postgresql://..."  or in the PSR_LEDGER_DATABASE_URL environment variable.
+    Each entity gets its own Postgres schema (psr_varun, psr_parle, ...).
+  * Otherwise a SQLite file per entity next to this file (psr_ledger_<entity>.db).
 
 A PSR (sales representative) gives goods on credit to shops and later collects.
   Credit     -> PSR's due goes UP
@@ -8,6 +14,7 @@ Balance due = opening due + credits - collections.
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -28,6 +35,119 @@ def entity_db(entity: str) -> Path:
 
 def current_path() -> Path:
     return Path(PATH_RESOLVER() if PATH_RESOLVER else DB_PATH)
+
+
+def _entity_of(path) -> str:
+    stem = Path(path).stem
+    ent = stem[len("psr_ledger_"):] if stem.startswith("psr_ledger_") else "default"
+    if not re.fullmatch(r"[a-z0-9_]{1,40}", ent):
+        raise ValueError(f"Bad entity name: {ent!r}")
+    return ent
+
+
+# ------------------------------------------------------------ online database
+_URL = "unset"
+_POOL = None
+
+
+def database_url() -> str | None:
+    global _URL
+    if _URL == "unset":
+        url = os.environ.get("PSR_LEDGER_DATABASE_URL")
+        if not url:
+            try:
+                import streamlit as st
+                url = st.secrets.get("database", {}).get("url")
+            except Exception:
+                url = None
+        ok = (url or "").startswith(("postgresql://", "postgres://")) and "[YOUR-PASSWORD]" not in url
+        _URL = url if ok else None  # ignore placeholders until the real link is in place
+    return _URL
+
+
+def is_online() -> bool:
+    return bool(database_url())
+
+
+def storage_label() -> str:
+    return "online database" if is_online() else f"this computer ({current_path().name})"
+
+
+def _pool():
+    global _POOL
+    if _POOL is None:
+        from psycopg_pool import ConnectionPool
+        # prepare_threshold=None: no server-side prepared statements, so Supabase's poolers work
+        _POOL = ConnectionPool(database_url(), min_size=1, max_size=4, open=True, timeout=20,
+                               kwargs={"prepare_threshold": None, "connect_timeout": 15},
+                               check=ConnectionPool.check_connection)
+    return _POOL
+
+
+class _Row(tuple):
+    """Row readable by position (row[0]) and by column name (row["id"]), like sqlite3.Row."""
+    def __new__(cls, values, names):
+        r = super().__new__(cls, values)
+        r._names = names
+        return r
+
+    def __getitem__(self, k):
+        return super().__getitem__(self._names.index(k) if isinstance(k, str) else k)
+
+
+def _row_factory(cursor):
+    names = [d.name for d in cursor.description] if cursor.description else []
+    return lambda values: _Row(values, names)
+
+
+class _Done:
+    def __init__(self, lastrowid=None, rowcount=0):
+        self.lastrowid, self.rowcount = lastrowid, rowcount
+
+
+def _to_pg(sql: str) -> str:
+    sql = sql.replace("%", "%%")
+    sql = re.sub(r":([a-z_]+)\b", r"%(\1)s", sql)
+    return sql.replace("?", "%s")
+
+
+class _PGCon:
+    def __init__(self, conn):
+        self.c = conn
+
+    def execute(self, sql, params=()):
+        q = _to_pg(sql)
+        insert = sql.lstrip().upper().startswith("INSERT")
+        if insert:
+            q += " RETURNING id"
+        cur = self.c.cursor(row_factory=_row_factory)
+        cur.execute(q, _clean(params) or None)
+        if insert:
+            return _Done(cur.fetchone()[0], cur.rowcount)
+        return cur
+
+
+def _clean(params):
+    """numpy / pandas values from data editors -> plain Python values the drivers accept."""
+    def one(v):
+        if hasattr(v, "item") and not isinstance(v, (str, bytes)):
+            v = v.item()
+        if isinstance(v, (datetime, pd.Timestamp)):
+            return str(pd.Timestamp(v).date())
+        if isinstance(v, date):
+            return str(v)
+        return v
+    if isinstance(params, dict):
+        return {k: one(v) for k, v in params.items()}
+    return tuple(one(v) for v in params)
+
+
+def query_df(con, sql, params=()) -> pd.DataFrame:
+    if isinstance(con, _PGCon):
+        cur = con.execute(sql, params)
+        cols = [d.name for d in cur.description]
+        return pd.DataFrame([tuple(r) for r in cur.fetchall()], columns=cols)
+    return pd.read_sql_query(sql, con, params=_clean(params))
 
 
 def archive_dir(path=None) -> Path:
@@ -75,6 +195,12 @@ CREATE INDEX IF NOT EXISTS ix_entries_date ON entries(entry_date);
 
 @contextmanager
 def connect(path=None):
+    if is_online():
+        schema = "psr_" + _entity_of(path or current_path())
+        with _pool().connection() as conn:          # commits on success, rolls back on error
+            conn.execute(f"SET LOCAL search_path TO {schema}")
+            yield _PGCon(conn)
+        return
     con = sqlite3.connect(path or current_path())
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
@@ -88,7 +214,53 @@ def connect(path=None):
         con.close()
 
 
+PG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS psrs (
+    id          BIGSERIAL PRIMARY KEY,
+    name        TEXT NOT NULL,
+    phone       TEXT DEFAULT '',
+    area        TEXT DEFAULT '',
+    opening_due DOUBLE PRECISION NOT NULL DEFAULT 0,
+    active      INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_psrs_name ON psrs (lower(name));
+CREATE TABLE IF NOT EXISTS entries (
+    id         BIGSERIAL PRIMARY KEY,
+    entry_date TEXT NOT NULL,
+    psr_id     BIGINT NOT NULL REFERENCES psrs(id),
+    shop       TEXT DEFAULT '',
+    kind       TEXT NOT NULL CHECK (kind IN ('Credit','Collection')),
+    amount     DOUBLE PRECISION NOT NULL CHECK (amount > 0),
+    mode       TEXT DEFAULT '',
+    bill_no    TEXT DEFAULT '',
+    notes      TEXT DEFAULT '',
+    raw_text   TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    archived   INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS archives (
+    id          BIGSERIAL PRIMARY KEY,
+    cutoff      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    n_entries   INTEGER NOT NULL,
+    credit      DOUBLE PRECISION NOT NULL,
+    collected   DOUBLE PRECISION NOT NULL,
+    export_file TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_entries_psr  ON entries(psr_id);
+CREATE INDEX IF NOT EXISTS ix_entries_date ON entries(entry_date)
+"""
+
+
 def init_db(path=None) -> None:
+    if is_online():
+        schema = "psr_" + _entity_of(path or current_path())
+        with _pool().connection() as conn:
+            conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            conn.execute(f"SET LOCAL search_path TO {schema}")
+            for stmt in filter(str.strip, PG_SCHEMA.split(";")):
+                conn.execute(stmt)
+        return
     with connect(path) as con:
         con.executescript(SCHEMA)
         cols = [r[1] for r in con.execute("PRAGMA table_info(entries)")]
@@ -108,7 +280,7 @@ def add_psr(name, phone="", area="", opening_due=0.0, path=None) -> int:
 
 def get_or_create_psr(name, path=None) -> int:
     with connect(path) as con:
-        row = con.execute("SELECT id FROM psrs WHERE name=?", (name.strip(),)).fetchone()
+        row = con.execute("SELECT id FROM psrs WHERE lower(name)=lower(?)", (name.strip(),)).fetchone()
     return row["id"] if row else add_psr(name, path=path)
 
 
@@ -117,7 +289,7 @@ def update_psr(pid, path=None, **fields) -> None:
     if fields:
         with connect(path) as con:
             con.execute(f"UPDATE psrs SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
-                        (*fields.values(), pid))
+                        _clean((*fields.values(), pid)))
 
 
 def delete_psr(pid, path=None) -> None:
@@ -129,8 +301,8 @@ def delete_psr(pid, path=None) -> None:
 
 def psrs(active_only=False, path=None) -> pd.DataFrame:
     with connect(path) as con:
-        return pd.read_sql_query("SELECT * FROM psrs" + (" WHERE active=1" if active_only else "")
-                                 + " ORDER BY name", con)
+        return query_df(con, "SELECT * FROM psrs" + (" WHERE active=1" if active_only else "")
+                                 + " ORDER BY name")
 
 
 # ----------------------------------------------------------------- entries
@@ -163,7 +335,7 @@ def update_entry(eid, path=None, **fields) -> None:
     if fields:
         with connect(path) as con:
             con.execute(f"UPDATE entries SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",
-                        (*fields.values(), eid))
+                        _clean((*fields.values(), eid)))
 
 
 def delete_entry(eid, path=None) -> None:
@@ -189,7 +361,7 @@ def entries(psr_id=None, start=None, end=None, kind=None, archived=False, path=N
         q += " AND e.kind=?"; args.append(kind)
     q += " ORDER BY e.entry_date DESC, e.id DESC"
     with connect(path) as con:
-        return pd.read_sql_query(q, con, params=args)
+        return query_df(con, q, params=args)
 
 
 def known_shops(path=None) -> list[str]:
@@ -212,7 +384,7 @@ def psr_summary(as_of=None, path=None) -> pd.DataFrame:
     GROUP BY p.id ORDER BY p.name
     """
     with connect(path) as con:
-        df = pd.read_sql_query(q, con, params=(as_of,))
+        df = query_df(con, q, params=(as_of,))
     df["due"] = (df["opening"] + df["credit"] - df["collected"]).round(2)
     last = pd.to_datetime(df["last_collection"].fillna(df["last_credit"]), errors="coerce")
     df["days_since_collection"] = (pd.Timestamp(as_of) - last).dt.days
@@ -227,7 +399,7 @@ def shop_summary(psr_id=None, path=None) -> pd.DataFrame:
          " FROM entries e JOIN psrs p ON p.id=e.psr_id"
          + (" WHERE e.psr_id=?" if psr_id else "") + " GROUP BY p.name, e.shop")
     with connect(path) as con:
-        df = pd.read_sql_query(q, con, params=(int(psr_id),) if psr_id else ())
+        df = query_df(con, q, params=(int(psr_id),) if psr_id else ())
     df["shop"] = df["shop"].replace("", "(no shop)")
     df["due"] = (df["credit"] - df["collected"]).round(2)
     return df.sort_values("due", ascending=False).reset_index(drop=True)
@@ -261,7 +433,7 @@ def daily(start=None, end=None, path=None) -> pd.DataFrame:
          " COUNT(*) AS entries FROM entries WHERE entry_date BETWEEN ? AND ?"
          " GROUP BY entry_date ORDER BY entry_date")
     with connect(path) as con:
-        return pd.read_sql_query(q, con, params=(str(start or "0000"), str(end or "9999")))
+        return query_df(con, q, params=(str(start or "0000"), str(end or "9999")))
 
 
 def totals(start=None, end=None, path=None) -> dict:
@@ -309,7 +481,7 @@ def monthly_psr(month: str, path=None) -> pd.DataFrame:
     GROUP BY p.id ORDER BY p.name
     """
     with connect(path) as con:
-        df = pd.read_sql_query(q, con, params={"s": start, "e": end})
+        df = query_df(con, q, params={"s": start, "e": end})
     df["closing"] = (df["opening"] + df["credit"] - df["collected"]).round(2)
     df["opening"] = df["opening"].round(2)
     keep = (df["active"] == 1) | (df[["opening", "credit", "collected", "closing"]].abs().sum(axis=1) > 0)
@@ -321,11 +493,11 @@ def monthly_overview(path=None) -> pd.DataFrame:
     months = months_available(path)[::-1]
     with connect(path) as con:
         opening = con.execute("SELECT COALESCE(SUM(opening_due),0) FROM psrs").fetchone()[0]
-        g = pd.read_sql_query(
+        g = query_df(con, 
             "SELECT substr(entry_date,1,7) AS month,"
             " SUM(CASE WHEN kind='Credit' THEN amount ELSE 0 END) AS credit,"
             " SUM(CASE WHEN kind='Collection' THEN amount ELSE 0 END) AS collected,"
-            " COUNT(*) AS entries, COUNT(DISTINCT psr_id) AS psrs FROM entries GROUP BY month", con)
+            " COUNT(*) AS entries, COUNT(DISTINCT psr_id) AS psrs FROM entries GROUP BY month")
     df = pd.DataFrame({"month": months}).merge(g, on="month", how="left").fillna(0)
     df["net"] = df["credit"] - df["collected"]
     df["closing"] = (opening + df["net"].cumsum()).round(2)
@@ -393,7 +565,7 @@ def archive_through(month: str, path=None) -> dict:
 
 def archives(path=None) -> pd.DataFrame:
     with connect(path) as con:
-        return pd.read_sql_query("SELECT * FROM archives ORDER BY cutoff DESC", con)
+        return query_df(con, "SELECT * FROM archives ORDER BY cutoff DESC")
 
 
 def restore_last_archive(path=None) -> str | None:

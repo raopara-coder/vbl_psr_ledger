@@ -34,8 +34,19 @@ Run the same `set` command again to change a password.
 1. New app → GitHub URL `https://github.com/raopara-coder/vbl_psr_ledger/blob/main/app.py`.
 2. Advanced settings → Secrets: paste the output of `python accounts.py secrets` (run on the PC that has
    `accounts.local.json`). It contains only usernames and password hashes.
-3. Note: Streamlit Cloud does not keep files between restarts, so a SQLite ledger there can be lost.
-   Use a hosted database before relying on the cloud copy.
+3. Also in Secrets, add the online database (see below). Without it the cloud app saves to its own disk,
+   which Streamlit Cloud wipes on every restart.
+
+## Online database (Supabase, free)
+1. supabase.com → New project. Use a database password with only letters and numbers.
+2. In the project, click **Connect** → **Session pooler** → copy the URI and put your password in it.
+3. Add to `.streamlit/secrets.toml` (PC) and to the Streamlit Cloud app's Secrets:
+   ```toml
+   [database]
+   url = "postgresql://postgres.xxxx:PASSWORD@aws-0-xx.pooler.supabase.com:5432/postgres"
+   ```
+Each entity gets its own Postgres schema (`psr_varun`, `psr_parle`), so the ledgers stay separate.
+Without a `[database]` url the app uses local SQLite files as before.
 
 ## Data
 - Each entity's ledger is a SQLite file: `psr_ledger_<entity>.db` (not committed — back it up yourself).
