@@ -73,6 +73,38 @@ def storage_label() -> str:
     return "online database" if is_online() else f"this computer ({current_path().name})"
 
 
+def check_online() -> str | None:
+    """None if the online database answers (or none is set up); otherwise a plain-English reason.
+    The password is never included."""
+    url = database_url()
+    if not url:
+        return None
+    try:
+        import psycopg
+        with psycopg.connect(url, connect_timeout=10, prepare_threshold=None) as c:
+            c.execute("SELECT 1")
+        return None
+    except Exception as ex:
+        msg = str(ex).strip().splitlines()[0] if str(ex).strip() else type(ex).__name__
+        pw = re.search(r"://[^:/@]+:([^@]*)@", url)
+        if pw and pw[1]:
+            msg = msg.replace(pw[1], "***")
+        host = re.search(r"@([^:/]+)", url)
+        hint = ""
+        low = msg.lower()
+        if "password authentication failed" in low:
+            hint = "The password in the [database] link is wrong."
+        elif "tenant or user not found" in low:
+            hint = "The user part of the link is wrong. It must be postgres.<project code> for the pooler."
+        elif host and host[1].startswith("db.") and host[1].endswith(".supabase.co"):
+            hint = "This is Supabase's Direct connection link. Use the Session pooler link instead."
+        elif "could not translate host name" in low or "name or service not known" in low:
+            hint = "The server name in the link is wrong."
+        elif "timeout" in low:
+            hint = "The database did not answer in time. It may be paused in Supabase, or the link is wrong."
+        return f"{hint} ({msg})" if hint else msg
+
+
 def _pool():
     global _POOL
     if _POOL is None:

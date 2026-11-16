@@ -806,6 +806,13 @@ def login_page():
                 st.error(f"Too many wrong tries. Wait {int((locked_until - datetime.now()).total_seconds())} "
                          "seconds and try again.")
             elif accounts.check(entity, user, pw):
+                with st.spinner("Connecting to the ledger…"):
+                    problem = db.check_online()
+                if problem:
+                    st.error("Your username and password are correct, but the online database can't be "
+                             f"reached.\n\n**{problem}**\n\nFix the `[database]` url in Streamlit → Settings → "
+                             "Secrets, then Reboot app.")
+                    return
                 for k in list(st.session_state):
                     del st.session_state[k]
                 st.session_state.update(entity=entity, username=user.strip().lower(), page="Overview")
@@ -856,4 +863,13 @@ if msg := st.session_state.pop("flash", None):
 if err := st.session_state.pop("flash_err", None):
     st.error(err)
 
-PAGES[st.session_state["page"]][1]()
+try:
+    PAGES[st.session_state["page"]][1]()
+except Exception as ex:
+    # Streamlit Cloud hides error text, so say plainly when the online database is the problem
+    if db.is_online() and type(ex).__name__ in {"PoolTimeout", "OperationalError", "ConnectionTimeout"}:
+        problem = db.check_online() or "The database did not answer in time. Try again in a minute."
+        st.error(f"**Can't reach the online database.**\n\n{problem}\n\nFix the `[database]` url in "
+                 "Streamlit → Settings → Secrets, then click **Reboot app**.")
+        st.stop()
+    raise
